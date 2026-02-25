@@ -13,9 +13,33 @@ namespace ClusterClient.Clients
         {
         }
 
-        public override Task<string> ProcessRequestAsync(string query, TimeSpan timeout)
+        public override async Task<string> ProcessRequestAsync(string query, TimeSpan timeout)
         {
-            throw new NotImplementedException();
+            var start = DateTime.Now;
+            var i = 0;
+            
+            foreach (var replicaAddress in ReplicaAddresses)
+            {
+                var elapsed = DateTime.Now - start;
+                var timeLeft = timeout - elapsed;
+                var perReplicaTimeout = TimeSpan.FromMilliseconds(timeLeft.TotalMilliseconds / (ReplicaAddresses.Length - i));
+                i++;
+                var request = CreateRequest(replicaAddress + "?query=" + query);
+                var task = ProcessRequestAsync(request);
+                var delayTask = Task.Delay(perReplicaTimeout);
+                var completedTask = await Task.WhenAny(task, delayTask);
+                if (completedTask == task)
+                {
+                    try
+                    {
+                        return await task;
+                    }
+                    catch (Exception)
+                    {
+                    }
+                }
+            }
+            throw new TimeoutException($"Request {query} timed out");
         }
 
         protected override ILog Log => LogManager.GetLogger(typeof(RoundRobinClusterClient));
