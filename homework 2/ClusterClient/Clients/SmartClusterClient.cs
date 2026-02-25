@@ -1,4 +1,5 @@
 ﻿using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Linq;
@@ -13,18 +14,23 @@ namespace ClusterClient.Clients
         public SmartClusterClient(string[] replicaAddresses) : base(replicaAddresses)
         {
         }
+        
+        private static readonly ConcurrentDictionary<string, long> ReplicaStats = new();
 
         public override async Task<string> ProcessRequestAsync(string query, TimeSpan timeout)
         {
-            var tasks = new List<Task<string>>();
+            var sortedReplicas = ReplicaAddresses
+                .OrderBy(uri => ReplicaStats.GetOrAdd(uri, 0))
+                .ToList();
+            
+            var tasks = new List<Task<ResponseData>>();
             var perReplicaTimeout = TimeSpan.FromMilliseconds(timeout.TotalMilliseconds / ReplicaAddresses.Length);
             var sw = Stopwatch.StartNew();
 
-            for (int i = 0; i < ReplicaAddresses.Length; i++)
+            for (int i = 0; i < sortedReplicas.Count; i++)
             {
-                var request = CreateRequest(ReplicaAddresses[i] + "?query=" + query);
-                var currentTask = ProcessRequestAsync(request);
-                tasks.Add(currentTask);
+                var request = CreateRequest(sortedReplicas[i] + "?query=" + query);
+                tasks.Add(ProcessAndMeasureAsync(sortedReplicas[i], request));
                 
                 while (true)
                 {
@@ -39,13 +45,16 @@ namespace ClusterClient.Clients
 
                     if (completedTask != delayTask)
                     {
-                        var finishedTask = await (Task<Task<string>>)completedTask;
+                        var finishedTask = await (Task<Task<ResponseData>>)completedTask;
                         try
                         {
-                            return await finishedTask;
+                            var response = await finishedTask;
+                            UpdateStats(response.Uri, response.ElapsedMs);
+                            return response.Content;
                         }
                         catch (Exception)
                         {
+                            UpdateStats(sortedReplicas[i], (long)timeout.TotalMilliseconds);
                             tasks.Remove(finishedTask);
                             if (tasks.Count == 0 || i < ReplicaAddresses.Length - 1)
                             {
@@ -63,6 +72,24 @@ namespace ClusterClient.Clients
             }
 
             throw new TimeoutException();
+        }
+        
+        private async Task<ResponseData> ProcessAndMeasureAsync(string uri, System.Net.WebRequest request)
+        {
+            var timer = Stopwatch.StartNew();
+            var content = await ProcessRequestAsync(request);
+            return new ResponseData { Uri = uri, Content = content, ElapsedMs = timer.ElapsedMilliseconds };
+        }
+        private void UpdateStats(string uri, long elapsedMs)
+        {
+            ReplicaStats.AddOrUpdate(uri, elapsedMs, (key, oldVal) => (oldVal + elapsedMs) / 2);
+        }
+        
+        private class ResponseData
+        {
+            public string Uri { get; set; }
+            public string Content { get; set; }
+            public long ElapsedMs { get; set; }
         }
 
         protected override ILog Log => LogManager.GetLogger(typeof(SmartClusterClient));
